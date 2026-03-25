@@ -12,8 +12,24 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.attention.ops.turboquant_kv_cache import (
+    get_turboquant_bits,
+    get_turboquant_packed_dim,
+    is_turboquant_kv_cache,
+)
 
 logger = init_logger(__name__)
+
+
+def _get_attention_entry_size_bytes(
+    head_size: int,
+    dtype: torch.dtype,
+    cache_dtype_str: str | None,
+) -> int:
+    if cache_dtype_str is not None and is_turboquant_kv_cache(cache_dtype_str):
+        bits = get_turboquant_bits(cache_dtype_str)
+        return get_turboquant_packed_dim(head_size, bits)
+    return head_size * get_dtype_size(dtype)
 
 
 @dataclass(frozen=True)
@@ -66,6 +82,7 @@ class AttentionSpec(KVCacheSpec):
     num_kv_heads: int
     head_size: int
     dtype: torch.dtype
+    cache_dtype_str: str | None = None
     page_size_padded: int | None = None
 
     @property
@@ -82,8 +99,11 @@ class AttentionSpec(KVCacheSpec):
             2
             * self.block_size
             * self.num_kv_heads
-            * self.head_size
-            * get_dtype_size(self.dtype)
+            * _get_attention_entry_size_bytes(
+                self.head_size,
+                self.dtype,
+                self.cache_dtype_str,
+            )
         )
 
 
@@ -150,6 +170,11 @@ class FullAttentionSpec(AttentionSpec):
             for spec in specs
             if spec.attention_chunk_size is not None
         )
+        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        assert len(cache_dtype_str_set) == 1, (
+            "All attention layers in the same KV cache group must use the same "
+            "cache dtype."
+        )
         assert not any(isinstance(spec, MLAAttentionSpec) for spec in specs), (
             "MLAAttentionSpec should be merged in MLAAttentionSpec.merge"
         )
@@ -159,6 +184,7 @@ class FullAttentionSpec(AttentionSpec):
             head_size=specs[0].head_size,
             head_size_v=specs[0].head_size_v,
             dtype=specs[0].dtype,
+            cache_dtype_str=cache_dtype_str_set.pop(),
             page_size_padded=specs[0].page_size_padded,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
@@ -182,8 +208,18 @@ class FullAttentionSpec(AttentionSpec):
         return (
             self.block_size
             * self.num_kv_heads
-            * (self.head_size + self.head_size_v)
-            * get_dtype_size(self.dtype)
+            * (
+                _get_attention_entry_size_bytes(
+                    self.head_size,
+                    self.dtype,
+                    self.cache_dtype_str,
+                )
+                + _get_attention_entry_size_bytes(
+                    self.head_size_v,
+                    self.dtype,
+                    self.cache_dtype_str,
+                )
+            )
         )
 
 
@@ -342,6 +378,11 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             for spec in specs
             if spec.attention_chunk_size is not None
         )
+        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        assert len(cache_dtype_str_set) == 1, (
+            "All attention layers in the same KV cache group must use the same "
+            "cache dtype."
+        )
         assert not any(isinstance(spec, MLAAttentionSpec) for spec in specs), (
             "MLAAttentionSpec should be merged in MLAAttentionSpec.merge"
         )
@@ -352,6 +393,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             head_size_v=specs[0].head_size_v,
             sink_len=specs[0].sink_len,
             dtype=specs[0].dtype,
+            cache_dtype_str=cache_dtype_str_set.pop(),
             page_size_padded=specs[0].page_size_padded,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),

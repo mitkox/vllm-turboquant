@@ -123,5 +123,6 @@ class ChunkedLocalAttention(Attention):
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_size,
             dtype=self.kv_cache_torch_dtype,
+            cache_dtype_str=vllm_config.cache_config.cache_dtype,
             attention_chunk_size=self.attention_chunk_size,
         )

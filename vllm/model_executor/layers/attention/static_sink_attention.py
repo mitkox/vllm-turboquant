@@ -217,6 +217,7 @@ class StaticSinkAttention(Attention, CustomOp):
             head_size_v=self.head_size_v,
             sink_len=self.sink_len,
             dtype=self.kv_cache_torch_dtype,
+            cache_dtype_str=vllm_config.cache_config.cache_dtype,
         )
 
 

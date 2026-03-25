@@ -6875,6 +6875,7 @@ class GPUModelRunner(
                     num_kv_heads=attn_module.num_kv_heads,
                     head_size=attn_module.head_size,
                     dtype=self.kv_cache_dtype,
+                    cache_dtype_str=self.cache_config.cache_dtype,
                 )
                 encoder_only_attn_specs[attn_spec].append(layer_name)
                 self.runner_only_attn_layers.add(layer_name)

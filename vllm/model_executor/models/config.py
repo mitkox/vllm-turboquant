@@ -168,6 +168,7 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
                 head_size=model_config.get_head_size(),
                 dtype=kv_cache_dtype,
+                cache_dtype_str=cache_config.cache_dtype,
             ).page_size_bytes
 
         model_cls, _ = ModelRegistry.resolve_model_cls(

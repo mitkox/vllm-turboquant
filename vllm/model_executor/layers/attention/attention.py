@@ -523,6 +523,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
                 dtype=self.kv_cache_torch_dtype,
+                cache_dtype_str=vllm_config.cache_config.cache_dtype,
                 sliding_window=self.sliding_window,
             )
         else:
@@ -532,6 +533,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size=self.head_size,
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
+                cache_dtype_str=vllm_config.cache_config.cache_dtype,
             )
 
 

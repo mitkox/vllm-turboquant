@@ -20,6 +20,10 @@ CacheDType = Literal[
     "fp8_e5m2",
     "fp8_inc",
     "fp8_ds_mla",
+    "turboquant1",
+    "turboquant2",
+    "turboquant3",
+    "turboquant4",
 ]
 MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]
@@ -227,5 +231,11 @@ class CacheConfig:
                 "memory footprint and boosts the performance. "
                 "Meanwhile, it may cause accuracy drop without a proper "
                 "scaling factor."
+            )
+        elif cache_dtype.startswith("turboquant"):
+            logger.warning(
+                "Using experimental TurboQuant KV cache with the Triton "
+                "attention backend. This path prioritizes compression and "
+                "correctness over raw attention throughput."
             )
         return cache_dtype

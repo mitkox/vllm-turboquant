@@ -203,6 +203,9 @@ cython_debug/
 # Results
 *.csv
 
+# Local paper / notes
+2504.19874v1.pdf
+
 # Python pickle files
 *.pkl
 

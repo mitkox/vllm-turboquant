@@ -48,6 +48,10 @@ You can configure how the quantization scales are computed in vLLM using three d
 - `kv_cache_dtype="auto"`: Use the model's default data type
 - `kv_cache_dtype="fp8_e4m3"`: Supported on CUDA 11.8+ and ROCm (AMD GPUs)
 - `kv_cache_dtype="fp8_e5m2"`: Supported on CUDA 11.8+
+- `kv_cache_dtype="turboquant1"`, `"turboquant2"`, `"turboquant3"`, `"turboquant4"`:
+  Experimental CUDA-only low-bit KV cache based on TurboQuant-style random
+  rotation plus scalar codebooks. This path currently runs through the
+  Triton attention backend and prioritizes compression over raw decode speed.
 
 ---
 
@@ -185,3 +189,34 @@ if __name__ == "__main__":
 ```
 
 For more detailed and up-to-date examples, see the [`llm-compressor` official examples](https://github.com/vllm-project/llm-compressor/tree/main/examples/quantization_kv_cache).
+
+---
+
+## Experimental TurboQuant KV Cache
+
+vLLM also includes an experimental TurboQuant-inspired KV-cache path for CUDA:
+
+```python
+from vllm import LLM, SamplingParams
+
+sampling_params = SamplingParams(temperature=0.0, max_tokens=32)
+llm = LLM(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    kv_cache_dtype="turboquant3",
+)
+print(llm.generate("Write a haiku about SRAM.", sampling_params)[0].outputs[0].text)
+```
+
+Notes:
+
+- This implementation follows the paper's online MSE-optimized quantizer:
+  a fixed random rotation, Lloyd-Max scalar codebooks, and packed low-bit
+  cache storage.
+- It does **not** currently implement the paper's QJL residual stage for
+  unbiased inner-product reconstruction.
+- It does **not** currently implement the paper's non-integer 2.5/3.5-bit
+  outlier split.
+- TurboQuant disables CUDA-graph capture for the Triton attention backend
+  because the current low-bit KV update and decode path is not graph-safe.
+- The current implementation is decoder-only and is substantially slower than
+  FP8 KV cache because it dequantizes gathered KV blocks before attention.
