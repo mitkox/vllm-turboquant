@@ -41,10 +41,8 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "int8": torch.int8,
     "fp8_inc": torch.float8_e4m3fn,
     "fp8_ds_mla": torch.uint8,
-    "turboquant1": torch.uint8,
-    "turboquant2": torch.uint8,
-    "turboquant3": torch.uint8,
-    "turboquant4": torch.uint8,
+    "turboquant25": torch.uint8,
+    "turboquant35": torch.uint8,
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {

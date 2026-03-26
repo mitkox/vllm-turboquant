@@ -48,10 +48,10 @@ You can configure how the quantization scales are computed in vLLM using three d
 - `kv_cache_dtype="auto"`: Use the model's default data type
 - `kv_cache_dtype="fp8_e4m3"`: Supported on CUDA 11.8+ and ROCm (AMD GPUs)
 - `kv_cache_dtype="fp8_e5m2"`: Supported on CUDA 11.8+
-- `kv_cache_dtype="turboquant1"`, `"turboquant2"`, `"turboquant3"`, `"turboquant4"`:
-  Experimental CUDA-only low-bit KV cache based on TurboQuant-style random
-  rotation plus scalar codebooks. This path currently runs through the
-  Triton attention backend and prioritizes compression over raw decode speed.
+- `kv_cache_dtype="turboquant25"`, `"turboquant35"`:
+  Experimental GB10-only TurboQuant KV cache for the Triton attention
+  backend. Uses mixed-bit quantization with a QJL residual stage.
+  Requires `--enable-turboquant` and an NVIDIA GB10 (SM121) GPU.
 
 ---
 
@@ -194,7 +194,7 @@ For more detailed and up-to-date examples, see the [`llm-compressor` official ex
 
 ## Experimental TurboQuant KV Cache
 
-vLLM also includes an experimental TurboQuant-inspired KV-cache path for CUDA:
+vLLM includes an experimental TurboQuant KV-cache path targeting the NVIDIA GB10 (SM121) GPU:
 
 ```python
 from vllm import LLM, SamplingParams
@@ -202,21 +202,21 @@ from vllm import LLM, SamplingParams
 sampling_params = SamplingParams(temperature=0.0, max_tokens=32)
 llm = LLM(
     model="meta-llama/Llama-3.1-8B-Instruct",
-    kv_cache_dtype="turboquant3",
+    kv_cache_dtype="turboquant25",
+    enable_turboquant=True,
 )
 print(llm.generate("Write a haiku about SRAM.", sampling_params)[0].outputs[0].text)
 ```
 
 Notes:
 
-- This implementation follows the paper's online MSE-optimized quantizer:
-  a fixed random rotation, Lloyd-Max scalar codebooks, and packed low-bit
-  cache storage.
-- It does **not** currently implement the paper's QJL residual stage for
-  unbiased inner-product reconstruction.
-- It does **not** currently implement the paper's non-integer 2.5/3.5-bit
-  outlier split.
-- TurboQuant disables CUDA-graph capture for the Triton attention backend
-  because the current low-bit KV update and decode path is not graph-safe.
-- The current implementation is decoder-only and is substantially slower than
-  FP8 KV cache because it dequantizes gathered KV blocks before attention.
+- TurboQuant uses a two-stage codec (MSE codebook + QJL residual) implemented
+  with GB10-only Triton kernels.
+- `turboquant25` targets ~2.5 bits/element: `32x3-bit + 96x2-bit` for `head_size=128`.
+- `turboquant35` targets ~3.5 bits/element: `64x4-bit + 64x3-bit` for `head_size=128`.
+- Unsupported modes (encoder-decoder cross-attention, attention sinks,
+  sliding-window attention, mm-prefix attention) are rejected at startup.
+- Encoder-only layers in mixed models pass through the standard Triton encoder path.
+- CUDA-graph capture is disabled for TurboQuant because the KV write path is
+  not graph-safe.
+- Requires NVIDIA GB10 / SM121.

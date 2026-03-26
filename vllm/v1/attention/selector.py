@@ -14,6 +14,7 @@ from vllm.v1.attention.backends.registry import (
     MAMBA_TYPE_TO_BACKEND_MAP,
     MambaAttentionBackendEnum,
 )
+from vllm.v1.attention.ops.turboquant_kv_cache import is_turboquant_kv_cache
 
 logger = init_logger(__name__)
 
@@ -71,6 +72,24 @@ def get_attn_backend(
     vllm_config = get_current_vllm_config()
 
     cache_config = vllm_config.cache_config
+    if kv_cache_dtype is not None and is_turboquant_kv_cache(kv_cache_dtype):
+        if cache_config is None or not cache_config.enable_turboquant:
+            raise ValueError(
+                "TurboQuant KV cache requires --enable-turboquant."
+            )
+        if attn_type == AttentionType.ENCODER_DECODER:
+            raise ValueError(
+                "TurboQuant KV cache does not support encoder-decoder "
+                "cross-attention yet."
+            )
+        if use_mm_prefix:
+            raise ValueError(
+                "TurboQuant KV cache does not support mm-prefix attention."
+            )
+        if has_sink:
+            raise ValueError(
+                "TurboQuant KV cache does not support attention sinks."
+            )
     if cache_config is not None and cache_config.user_specified_block_size:
         block_size = cache_config.block_size
     else:

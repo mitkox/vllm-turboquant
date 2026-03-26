@@ -33,16 +33,25 @@ from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
 )
+from vllm.v1.attention.ops.triton_turboquant_decode import (
+    get_turboquant_norm_lut,
+    turboquant_decode_attention_fwd,
+)
+from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.attention.ops.turboquant_kv_cache import (
-    dequantize_turboquant_vectors,
+    TurboQuantLayout,
+    build_turboquant_outlier_masks,
     get_turboquant_bits,
     get_turboquant_centroids,
+    get_turboquant_group_dims,
+    get_turboquant_layout,
+    get_turboquant_mse_codebook_bits,
     get_turboquant_packed_dim,
+    get_turboquant_qjl_matrix,
     get_turboquant_rotation,
     is_turboquant_kv_cache,
     quantize_turboquant_vectors,
 )
-from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
@@ -51,6 +60,8 @@ logger = init_logger(__name__)
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+GB10_CAPABILITY = DeviceCapability(12, 1)
+TURBOQUANT_TRITON_PREFILL_MAX_HEAD_SIZE = 128
 
 
 @dataclass
@@ -66,8 +77,10 @@ class TritonAttentionMetadata:
     num_actual_tokens: int  # Number of tokens excluding padding.
     max_query_len: int
     query_start_loc: torch.Tensor
+    query_start_loc_cpu: torch.Tensor
     max_seq_len: int
     seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
 
@@ -88,6 +101,8 @@ class TritonAttentionMetadata:
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
+    turboquant_seq_ids: torch.Tensor | None = None
+    turboquant_token_seq_lens: torch.Tensor | None = None
 
     @property
     def mm_prefix_range_tensor(self) -> torch.Tensor | None:
@@ -242,7 +257,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
 
         max_seq_len = common_attn_metadata.max_seq_len
         query_start_loc = common_attn_metadata.query_start_loc
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         seq_lens = common_attn_metadata.seq_lens
+        seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
 
@@ -267,8 +284,10 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
             query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
             use_cascade=use_cascade,
@@ -300,10 +319,8 @@ class TritonAttentionBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
-        "turboquant1",
-        "turboquant2",
-        "turboquant3",
-        "turboquant4",
+        "turboquant25",
+        "turboquant35",
     ]
 
     @staticmethod
@@ -393,6 +410,28 @@ class TritonAttentionBackend(AttentionBackend):
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return True
 
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        device_capability: DeviceCapability,
+    ) -> str | None:
+        if kv_cache_dtype is None or not is_turboquant_kv_cache(kv_cache_dtype):
+            return None
+        if not current_platform.is_cuda():
+            return "TurboQuant KV cache requires CUDA"
+        if device_capability != GB10_CAPABILITY:
+            return "TurboQuant KV cache requires NVIDIA GB10 / SM121"
+        if has_sink:
+            return "TurboQuant KV cache does not support attention sinks"
+        return None
+
 
 class TritonAttentionImpl(AttentionImpl):
     def fused_output_quant_supported(self, quant_key: QuantKey):
@@ -438,8 +477,35 @@ class TritonAttentionImpl(AttentionImpl):
         self.attn_type = attn_type
         self.fp8_dtype = current_platform.fp8_dtype()
         self.turboquant_bits = (
-            get_turboquant_bits(kv_cache_dtype) if is_turboquant_kv_cache(kv_cache_dtype) else None
+            get_turboquant_bits(kv_cache_dtype)
+            if is_turboquant_kv_cache(kv_cache_dtype)
+            else None
         )
+        self._turboquant_tables: dict[
+            tuple[str, int | None],
+            tuple[
+                tuple[torch.Tensor, torch.Tensor],
+                tuple[torch.Tensor, torch.Tensor],
+                dict[int, torch.Tensor],
+                torch.Tensor,
+                TurboQuantLayout,
+            ],
+        ] = {}
+        self._turboquant_masks: dict[
+            tuple[str, int | None],
+            tuple[
+                tuple[torch.Tensor, torch.Tensor],
+                tuple[torch.Tensor, torch.Tensor],
+            ],
+        ] = {}
+        self._turboquant_query_group_indices: dict[
+            tuple[str, int | None],
+            tuple[
+                torch.Tensor,
+                tuple[torch.Tensor, torch.Tensor],
+                tuple[torch.Tensor, torch.Tensor],
+            ],
+        ] = {}
 
         self.sinks = sinks
         if sinks is not None:
@@ -450,6 +516,167 @@ class TritonAttentionImpl(AttentionImpl):
             )
         self.use_alibi_sqrt = use_alibi_sqrt
         self.supports_quant_query_input = current_platform.is_cuda()
+
+        if self.turboquant_bits is not None:
+            capability = current_platform.get_device_capability()
+            if not current_platform.is_cuda() or capability != GB10_CAPABILITY:
+                raise RuntimeError(
+                    "TurboQuant KV cache requires NVIDIA GB10 / SM121."
+                )
+            if attn_type == AttentionType.ENCODER_DECODER:
+                raise NotImplementedError(
+                    "TurboQuant KV cache does not support encoder-decoder "
+                    "cross-attention yet."
+                )
+            if sinks is not None:
+                raise NotImplementedError(
+                    "TurboQuant KV cache does not support attention sinks yet."
+                )
+            if logits_soft_cap:
+                raise NotImplementedError(
+                    "TurboQuant KV cache does not support logits soft capping yet."
+                )
+            if self.sliding_window != (-1, -1):
+                raise NotImplementedError(
+                    "TurboQuant KV cache does not support sliding window attention yet."
+                )
+
+    def _get_turboquant_tables(
+        self,
+        device: torch.device,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+        dict[int, torch.Tensor],
+        torch.Tensor,
+        TurboQuantLayout,
+    ]:
+        assert self.turboquant_bits is not None
+        cache_key = (device.type, device.index)
+        tables = self._turboquant_tables.get(cache_key)
+        if tables is None:
+            group_dims = get_turboquant_group_dims(self.head_size, self.kv_cache_dtype)
+            layout = get_turboquant_layout(self.kv_cache_dtype, self.head_size)
+            centroid_dims = {
+                group.mse_bits: group.dim
+                for group in layout.groups
+                if group.mse_bits > 0
+            }
+            centroids = {
+                mse_bits: get_turboquant_centroids(
+                    device,
+                    dim,
+                    mse_bits,
+                )
+                for mse_bits, dim in centroid_dims.items()
+            }
+            tables = (
+                (
+                    get_turboquant_rotation(device, group_dims[0], seed_offset=101),
+                    get_turboquant_rotation(device, group_dims[1], seed_offset=211),
+                ),
+                (
+                    get_turboquant_qjl_matrix(device, group_dims[0], seed_offset=307),
+                    get_turboquant_qjl_matrix(device, group_dims[1], seed_offset=401),
+                ),
+                centroids,
+                get_turboquant_norm_lut(device),
+                layout,
+            )
+            self._turboquant_tables[cache_key] = tables
+        return tables
+
+    def _validate_turboquant_device(self, device: torch.device) -> None:
+        if device.type != "cuda":
+            raise RuntimeError("TurboQuant KV cache requires CUDA.")
+        if torch.cuda.get_device_capability(device) != (12, 1):
+            raise RuntimeError(
+                "TurboQuant KV cache requires NVIDIA GB10 / SM121."
+            )
+
+    def _ensure_turboquant_masks(
+        self,
+        device: torch.device,
+        key: torch.Tensor | None = None,
+        value: torch.Tensor | None = None,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+        cache_key = (device.type, device.index)
+        masks = self._turboquant_masks.get(cache_key)
+        if masks is not None:
+            return masks
+        if key is None or value is None:
+            raise RuntimeError(
+                "TurboQuant KV cache masks are not initialized before decode."
+            )
+        masks = (
+            build_turboquant_outlier_masks(key, self.kv_cache_dtype),
+            build_turboquant_outlier_masks(value, self.kv_cache_dtype),
+        )
+        self._turboquant_masks[cache_key] = masks
+        return masks
+
+    def _get_turboquant_query_group_indices(
+        self,
+        device: torch.device,
+    ) -> tuple[
+        torch.Tensor,
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+    ]:
+        cache_key = (device.type, device.index)
+        indices = self._turboquant_query_group_indices.get(cache_key)
+        if indices is not None:
+            return indices
+
+        key_masks, value_masks = self._ensure_turboquant_masks(device)
+        kv_head_for_query_head = (
+            torch.arange(self.num_heads, device=device, dtype=torch.int64)
+            // self.num_queries_per_kv
+        )
+        indices = (
+            kv_head_for_query_head,
+            tuple(
+                group.index_select(0, kv_head_for_query_head) for group in key_masks
+            ),
+            tuple(
+                group.index_select(0, kv_head_for_query_head) for group in value_masks
+            ),
+        )
+        self._turboquant_query_group_indices[cache_key] = indices
+        return indices
+
+    def _ensure_turboquant_decode_metadata(
+        self,
+        attn_metadata: TritonAttentionMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if attn_metadata.turboquant_seq_ids is None:
+            query_lens = attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
+            seq_ids = torch.repeat_interleave(
+                torch.arange(
+                    attn_metadata.seq_lens.shape[0],
+                    device=attn_metadata.seq_lens.device,
+                    dtype=torch.int32,
+                ),
+                query_lens,
+            )
+            token_offsets = (
+                torch.arange(
+                    attn_metadata.num_actual_tokens,
+                    device=attn_metadata.query_start_loc.device,
+                    dtype=torch.int32,
+                )
+                - attn_metadata.query_start_loc.index_select(0, seq_ids.to(torch.int64))
+            )
+            attn_metadata.turboquant_seq_ids = seq_ids
+            attn_metadata.turboquant_token_seq_lens = (
+                attn_metadata.seq_lens.index_select(0, seq_ids.to(torch.int64))
+                - query_lens.index_select(0, seq_ids.to(torch.int64))
+                + token_offsets
+                + 1
+            ).to(torch.int32)
+
+        assert attn_metadata.turboquant_token_seq_lens is not None
+        return attn_metadata.turboquant_seq_ids, attn_metadata.turboquant_token_seq_lens
 
     def forward(
         self,
@@ -518,6 +745,8 @@ class TritonAttentionImpl(AttentionImpl):
         if is_turboquant_kv_cache(self.kv_cache_dtype):
             return self._forward_turboquant(
                 query=query[:num_actual_tokens],
+                key=key[:num_actual_tokens],
+                value=value[:num_actual_tokens],
                 key_cache=key_cache,
                 value_cache=value_cache,
                 output=output[:num_actual_tokens],
@@ -641,24 +870,43 @@ class TritonAttentionImpl(AttentionImpl):
         if is_turboquant_kv_cache(self.kv_cache_dtype):
             if kv_cache.numel() == 0:
                 return
+            self._validate_turboquant_device(key.device)
             valid = slot_mapping >= 0
             if not valid.any().item():
                 return
 
             assert self.turboquant_bits is not None
-            rotation = get_turboquant_rotation(key.device, self.head_size)
-            centroids = get_turboquant_centroids(
-                key.device, self.head_size, self.turboquant_bits
+            rotations, qjl_matrices, centroids, _, _ = self._get_turboquant_tables(
+                key.device
             )
+            key_masks, value_masks = self._ensure_turboquant_masks(
+                key.device,
+                key=key[valid],
+                value=value[valid],
+            )
+            valid_key = key[valid]
+            valid_value = value[valid]
             packed_key = quantize_turboquant_vectors(
-                key[valid], self.turboquant_bits, rotation, centroids
+                valid_key,
+                self.kv_cache_dtype,
+                rotations,
+                qjl_matrices,
+                centroids,
+                key_masks,
             )
             packed_value = quantize_turboquant_vectors(
-                value[valid], self.turboquant_bits, rotation, centroids
+                valid_value,
+                self.kv_cache_dtype,
+                rotations,
+                qjl_matrices,
+                centroids,
+                value_masks,
             )
 
             valid_slots = slot_mapping[valid]
-            block_idx = torch.div(valid_slots, key_cache.shape[1], rounding_mode="floor")
+            block_idx = torch.div(
+                valid_slots, key_cache.shape[1], rounding_mode="floor"
+            )
             block_offset = valid_slots % key_cache.shape[1]
             key_cache[block_idx, block_offset] = packed_key
             value_cache[block_idx, block_offset] = packed_value
@@ -724,6 +972,8 @@ class TritonAttentionImpl(AttentionImpl):
     def _forward_turboquant(
         self,
         query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         output: torch.Tensor,
@@ -734,7 +984,9 @@ class TritonAttentionImpl(AttentionImpl):
                 "TurboQuant KV cache currently supports decoder attention only."
             )
         if self.sinks is not None:
-            raise NotImplementedError("TurboQuant KV cache does not support sinks yet.")
+            raise NotImplementedError(
+                "TurboQuant KV cache does not support sinks yet."
+            )
         if self.logits_soft_cap:
             raise NotImplementedError(
                 "TurboQuant KV cache does not support logits soft capping yet."
@@ -752,69 +1004,78 @@ class TritonAttentionImpl(AttentionImpl):
                 "TurboQuant KV cache does not support mm-prefix ranges yet."
             )
 
-        assert self.turboquant_bits is not None
-        rotation = get_turboquant_rotation(query.device, self.head_size)
-        centroids = get_turboquant_centroids(
-            query.device, self.head_size, self.turboquant_bits
+        query_lens_cpu = (
+            attn_metadata.query_start_loc_cpu[1:] - attn_metadata.query_start_loc_cpu[:-1]
         )
-        query_lens = attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
-        block_size = key_cache.shape[1]
+        if torch.equal(query_lens_cpu, attn_metadata.seq_lens_cpu):
+            if query.shape[-1] <= TURBOQUANT_TRITON_PREFILL_MAX_HEAD_SIZE:
+                context_attention_fwd(
+                    q=query,
+                    k=key,
+                    v=value,
+                    o=output,
+                    b_start_loc=attn_metadata.query_start_loc,
+                    b_seq_len=attn_metadata.seq_lens,
+                    max_input_len=attn_metadata.max_query_len,
+                    is_causal=True,
+                    softmax_scale=self.scale,
+                    sliding_window_q=self.sliding_window[0],
+                    sliding_window_k=self.sliding_window[1],
+                )
+            else:
+                for seq_idx, seq_len in enumerate(attn_metadata.seq_lens_cpu.tolist()):
+                    q_start = int(attn_metadata.query_start_loc_cpu[seq_idx].item())
+                    q_end = int(attn_metadata.query_start_loc_cpu[seq_idx + 1].item())
+                    seq_query = query[q_start:q_end].permute(1, 0, 2).unsqueeze(0)
+                    seq_key = key[q_start:q_end].permute(1, 0, 2).unsqueeze(0)
+                    seq_value = value[q_start:q_end].permute(1, 0, 2).unsqueeze(0)
+                    seq_output = F.scaled_dot_product_attention(
+                        seq_query,
+                        seq_key,
+                        seq_value,
+                        attn_mask=None,
+                        dropout_p=0.0,
+                        is_causal=True,
+                        enable_gqa=query.shape[1] > key.shape[1],
+                        scale=self.scale,
+                    )
+                    output[q_start:q_end].copy_(seq_output.squeeze(0).permute(1, 0, 2))
+            return output
 
-        for seq_idx in range(attn_metadata.seq_lens.shape[0]):
-            q_start = int(attn_metadata.query_start_loc[seq_idx].item())
-            q_len = int(query_lens[seq_idx].item())
-            seq_len = int(attn_metadata.seq_lens[seq_idx].item())
-            if q_len == 0 or seq_len == 0:
-                continue
-
-            q_end = q_start + q_len
-            num_blocks = (seq_len + block_size - 1) // block_size
-            block_ids = attn_metadata.block_table[seq_idx, :num_blocks].to(torch.int64)
-
-            seq_key_cache = key_cache.index_select(0, block_ids).reshape(
-                num_blocks * block_size, self.num_kv_heads, -1
-            )[:seq_len]
-            seq_value_cache = value_cache.index_select(0, block_ids).reshape(
-                num_blocks * block_size, self.num_kv_heads, -1
-            )[:seq_len]
-
-            seq_key = dequantize_turboquant_vectors(
-                seq_key_cache,
-                self.turboquant_bits,
-                self.head_size,
-                rotation,
-                centroids,
-                query.dtype,
-            )
-            seq_value = dequantize_turboquant_vectors(
-                seq_value_cache,
-                self.turboquant_bits,
-                self.head_size,
-                rotation,
-                centroids,
-                query.dtype,
-            )
-
-            seq_query = query[q_start:q_end]
-            q_states = seq_query.permute(1, 0, 2).unsqueeze(0)
-            k_states = seq_key.permute(1, 0, 2).unsqueeze(0)
-            v_states = seq_value.permute(1, 0, 2).unsqueeze(0)
-
-            query_positions = torch.arange(
-                seq_len - q_len, seq_len, device=query.device, dtype=torch.int32
-            )
-            key_positions = torch.arange(seq_len, device=query.device, dtype=torch.int32)
-            causal_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
-
-            seq_output = F.scaled_dot_product_attention(
-                q_states,
-                k_states,
-                v_states,
-                attn_mask=causal_mask.view(1, 1, q_len, seq_len),
-                dropout_p=0.0,
-                enable_gqa=self.num_queries_per_kv > 1,
-                scale=self.scale,
-            )
-            output[q_start:q_end].copy_(seq_output.squeeze(0).permute(1, 0, 2))
-
+        assert self.turboquant_bits is not None
+        self._validate_turboquant_device(query.device)
+        rotations, qjl_matrices, centroids, norm_lut, _ = self._get_turboquant_tables(
+            query.device
+        )
+        key_masks, value_masks = self._ensure_turboquant_masks(query.device)
+        token_seq_ids, token_seq_lens = self._ensure_turboquant_decode_metadata(
+            attn_metadata
+        )
+        kv_head_for_query_head, key_query_group_indices, value_query_group_indices = (
+            self._get_turboquant_query_group_indices(query.device)
+        )
+        turboquant_decode_attention_fwd(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=attn_metadata.block_table,
+            query_start_loc=attn_metadata.query_start_loc,
+            seq_lens=attn_metadata.seq_lens,
+            key_group_indices=key_masks,
+            value_group_indices=value_masks,
+            key_rotations=rotations,
+            key_qjl_matrices=qjl_matrices,
+            value_rotations=rotations,
+            value_qjl_matrices=qjl_matrices,
+            centroids=centroids,
+            norm_lut=norm_lut,
+            softmax_scale=self.scale,
+            kv_cache_dtype=self.kv_cache_dtype,
+            token_seq_ids=token_seq_ids,
+            token_seq_lens=token_seq_lens,
+            kv_head_for_query_head=kv_head_for_query_head,
+            key_query_group_indices=key_query_group_indices,
+            value_query_group_indices=value_query_group_indices,
+            out=output,
+        )
         return output

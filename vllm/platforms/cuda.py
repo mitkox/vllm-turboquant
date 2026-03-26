@@ -23,6 +23,7 @@ import vllm._C_stable_libtorch  # noqa
 from vllm.logger import init_logger
 from vllm.utils.import_utils import import_pynvml
 from vllm.utils.torch_utils import cuda_device_count_stateless
+from vllm.v1.attention.ops.turboquant_kv_cache import is_turboquant_kv_cache
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .interface import DeviceCapability, Platform, PlatformEnum
@@ -55,6 +56,9 @@ def _get_backend_priorities(
     kv_cache_dtype: CacheDType | None = None,
 ) -> list[AttentionBackendEnum]:
     """Get backend priorities with lazy import to avoid circular dependency."""
+    if kv_cache_dtype is not None and is_turboquant_kv_cache(kv_cache_dtype):
+        return [AttentionBackendEnum.TRITON_ATTN]
+
     if use_mla:
         if device_capability.major == 10:
             # Sparse MLA backend priorities

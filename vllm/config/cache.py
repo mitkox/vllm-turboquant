@@ -20,10 +20,8 @@ CacheDType = Literal[
     "fp8_e5m2",
     "fp8_inc",
     "fp8_ds_mla",
-    "turboquant1",
-    "turboquant2",
-    "turboquant3",
-    "turboquant4",
+    "turboquant25",
+    "turboquant35",
 ]
 MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]
@@ -93,6 +91,8 @@ class CacheConfig:
     checkpoint if available. Otherwise, the scales will default to 1.0."""
     cpu_kvcache_space_bytes: int | None = None
     """(CPU backend only) CPU key-value cache space."""
+    enable_turboquant: bool = False
+    """Enable the GB10-only TurboQuant KV cache (requires NVIDIA GB10 / SM121)."""
     mamba_page_size_padded: int | None = None
     """ Optional override for mamba page size; used by hybrid mamba/attention
     models to ensure exact alignment with attention page size."""
@@ -234,8 +234,30 @@ class CacheConfig:
             )
         elif cache_dtype.startswith("turboquant"):
             logger.warning(
-                "Using experimental TurboQuant KV cache with the Triton "
-                "attention backend. This path prioritizes compression and "
-                "correctness over raw attention throughput."
+                "Using TurboQuant KV cache with the Triton attention backend "
+                "(requires NVIDIA GB10 / SM121)."
             )
         return cache_dtype
+
+    @model_validator(mode="after")
+    def _validate_turboquant(self) -> "CacheConfig":
+        if not self.cache_dtype.startswith("turboquant"):
+            return self
+
+        if not self.enable_turboquant:
+            raise ValueError(
+                "TurboQuant KV cache requires "
+                "cache_config.enable_turboquant=True."
+            )
+
+        from vllm.platforms import current_platform
+
+        if not current_platform.is_cuda():
+            raise ValueError("TurboQuant KV cache requires CUDA.")
+
+        capability = current_platform.get_device_capability()
+        if capability is None or (capability.major, capability.minor) != (12, 1):
+            raise ValueError(
+                "TurboQuant KV cache requires NVIDIA GB10 / SM121."
+            )
+        return self
