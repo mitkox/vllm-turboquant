@@ -56,12 +56,56 @@ vLLM seamlessly supports most popular open-source models on HuggingFace, includi
 
 Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
 
+## TurboQuant Fork Highlights
+
+This fork extends vLLM's experimental TurboQuant KV-cache path with a workflow
+aimed at supported CUDA workstation GPUs:
+
+- TurboQuant KV cache on `RTX A6000 / SM86` and `GB10 / SM121`
+- `turboquant25` and `turboquant35` KV-cache recipes on the Triton attention backend
+- Per-layer TurboQuant metadata loading from `--turboquant-metadata-path` or a local model-side `turboquant_kv.json`
+- Tensor-parallel metadata slicing for replicated and partitioned KV-head layouts
+- Kernel tuning for supported CUDA targets and a Triton prefill fast path for common head sizes
+- Benchmark and bring-up docs for long-context TurboQuant comparisons and 4x A6000 serving
+
+Start here for the fork-specific docs:
+
+- [Quantized KV Cache docs](docs/features/quantization/quantized_kvcache.md)
+- [TurboQuant on RTX A6000 and CUDA 12.8](docs/features/quantization/turboquant_a6000.md)
+- [TurboQuant comparison benchmark](benchmarks/run_turboquant_gb10_compare.sh)
+
 ## Getting Started
 
 Install vLLM with `pip` or [from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source):
 
 ```bash
 pip install vllm
+```
+
+For TurboQuant on this fork, use a source build instead of precompiled wheels:
+
+```bash
+uv venv --python 3.12
+source .venv/bin/activate
+
+export CUDA_HOME=/usr/local/cuda-12.8
+export PATH="${CUDA_HOME}/bin:${PATH}"
+export VLLM_TARGET_DEVICE=cuda
+export VLLM_USE_PRECOMPILED=0
+export VLLM_MAIN_CUDA_VERSION=12.8
+
+uv pip install -e .
+```
+
+Example TurboQuant serve command:
+
+```bash
+.venv/bin/vllm serve /models/target \
+  --tensor-parallel-size 4 \
+  --attention-backend TRITON_ATTN \
+  --kv-cache-dtype turboquant35 \
+  --enable-turboquant \
+  --turboquant-metadata-path /models/target/turboquant_kv.json
 ```
 
 Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.

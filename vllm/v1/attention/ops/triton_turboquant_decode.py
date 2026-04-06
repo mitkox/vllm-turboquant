@@ -11,9 +11,12 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.turboquant_kv_cache import (
     TURBOQUANT_QJL_SCALE,
     apply_turboquant_query_transforms,
+    get_turboquant_kernel_meta,
     get_turboquant_layout,
     get_turboquant_mse_inverse_transform_matrix,
+    get_turboquant_platform_requirement,
     get_turboquant_qjl_inverse_transform_matrix,
+    supports_turboquant_cuda,
 )
 
 
@@ -28,12 +31,12 @@ def get_turboquant_norm_lut(device: torch.device) -> torch.Tensor:
     return _norm_lut(device.type, device.index)
 
 
-def _require_gb10_cuda(device: torch.device) -> None:
+def _require_turboquant_cuda(device: torch.device) -> None:
     if device.type != "cuda":
         raise ValueError("TurboQuant Triton decode requires CUDA tensors.")
     capability = torch.cuda.get_device_capability(device)
-    if capability != (12, 1):
-        raise ValueError("TurboQuant KV cache requires NVIDIA GB10 / SM121.")
+    if not supports_turboquant_cuda(capability):
+        raise ValueError(get_turboquant_platform_requirement())
 
 
 @triton.jit
@@ -371,15 +374,9 @@ def _turboquant_decode_kernel(
                 )
                 is_valid = range_start < range_end
                 q_in_range = (
-                    (query_pos >= range_start)
-                    & (query_pos <= range_end)
-                    & is_valid
+                    (query_pos >= range_start) & (query_pos <= range_end) & is_valid
                 )
-                k_in_range = (
-                    (offs_n >= range_start)
-                    & (offs_n <= range_end)
-                    & is_valid
-                )
+                k_in_range = (offs_n >= range_start) & (offs_n <= range_end) & is_valid
                 valid_mask = valid_mask | (q_in_range & k_in_range)
         logits = tl.where(valid_mask, logits, float("-inf"))
 
@@ -639,7 +636,8 @@ def turboquant_decode_attention_fwd(
 ) -> torch.Tensor:
     if query.ndim != 3:
         raise ValueError(f"Expected query shape [T, H, D], got {query.shape}")
-    _require_gb10_cuda(query.device)
+    _require_turboquant_cuda(query.device)
+    kernel_meta = get_turboquant_kernel_meta(query.device, query.shape[-1])
 
     layout = get_turboquant_layout(kv_cache_dtype, query.shape[-1])
     kv_group_num = query.shape[1] // key_cache.shape[2]
@@ -689,7 +687,7 @@ def turboquant_decode_attention_fwd(
     group1 = layout.groups[1]
     g0_pad = triton.next_power_of_2(group0.dim)
     g1_pad = triton.next_power_of_2(group1.dim)
-    block_n = 8 if query.shape[-1] >= 256 else 16
+    block_n = kernel_meta.decode_block_n
 
     acc_mse_0 = torch.empty_like(q_rot[0], dtype=torch.float32)
     acc_qjl_0 = torch.empty_like(q_rot[0], dtype=torch.float32)
@@ -784,7 +782,7 @@ def turboquant_decode_attention_fwd(
         G1_VECTOR_NORM_OFFSET=group1.vector_norm_offset,
         G1_RESIDUAL_NORM_OFFSET=group1.residual_norm_offset,
         G1_QJL_SCALE=TURBOQUANT_QJL_SCALE / group1.dim,
-        num_warps=4,
+        num_warps=kernel_meta.decode_num_warps,
         num_stages=2,
     )
 
@@ -842,7 +840,7 @@ def turboquant_decode_attention_fwd(
             DIM_PADDED=dim_pad,
             BLOCK_OUT=block_out,
             BLOCK_K=block_k,
-            num_warps=4,
+            num_warps=kernel_meta.postprocess_num_warps,
             num_stages=2,
         )
 

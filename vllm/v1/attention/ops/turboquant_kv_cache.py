@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from functools import cache
+from typing import Any
 
 import torch
 
@@ -30,6 +31,19 @@ TURBOQUANT_QJL_SEED_OFFSET = 10_000
 TURBOQUANT_QJL_SCALE = math.sqrt(math.pi / 2.0)
 TURBOQUANT_CODEBOOK_GRID_POINTS = 32768
 TURBOQUANT_CODEBOOK_EPS = 1e-6
+TURBOQUANT_SUPPORTED_CUDA_CAPABILITIES = frozenset(((8, 6), (12, 1)))
+TURBOQUANT_PLATFORM_REQUIREMENT = (
+    "TurboQuant currently supports RTX A6000 / SM86 and GB10 / SM121 on CUDA."
+)
+
+
+@dataclass(frozen=True)
+class TurboQuantKernelMeta:
+    decode_block_n: int
+    decode_num_warps: int
+    update_tile: int
+    update_num_warps: int
+    postprocess_num_warps: int
 
 
 @dataclass(frozen=True)
@@ -53,6 +67,56 @@ class TurboQuantLayout:
 
 def is_turboquant_kv_cache(kv_cache_dtype: str) -> bool:
     return kv_cache_dtype in TURBOQUANT_KV_CACHE_BITS
+
+
+def get_turboquant_platform_requirement() -> str:
+    return TURBOQUANT_PLATFORM_REQUIREMENT
+
+
+def _normalize_turboquant_cuda_capability(
+    capability: Any | None,
+) -> tuple[int, int] | None:
+    if capability is None:
+        return None
+    if hasattr(capability, "major") and hasattr(capability, "minor"):
+        return (int(capability.major), int(capability.minor))
+    if isinstance(capability, (tuple, list)) and len(capability) >= 2:
+        return (int(capability[0]), int(capability[1]))
+    raise TypeError(f"Unsupported CUDA capability value: {capability!r}")
+
+
+def supports_turboquant_cuda(capability: Any | None) -> bool:
+    normalized = _normalize_turboquant_cuda_capability(capability)
+    return normalized in TURBOQUANT_SUPPORTED_CUDA_CAPABILITIES
+
+
+def get_turboquant_kernel_meta(
+    device: torch.device,
+    head_size: int,
+) -> TurboQuantKernelMeta:
+    if device.type != "cuda":
+        raise ValueError("TurboQuant Triton kernels require CUDA tensors.")
+
+    capability = _normalize_turboquant_cuda_capability(
+        torch.cuda.get_device_capability(device)
+    )
+    assert capability is not None
+    if capability == (8, 6):
+        return TurboQuantKernelMeta(
+            decode_block_n=8,
+            decode_num_warps=2,
+            update_tile=16,
+            update_num_warps=2,
+            postprocess_num_warps=2,
+        )
+
+    return TurboQuantKernelMeta(
+        decode_block_n=8 if head_size >= 256 else 16,
+        decode_num_warps=4,
+        update_tile=32,
+        update_num_warps=4,
+        postprocess_num_warps=4,
+    )
 
 
 def get_turboquant_bits(kv_cache_dtype: str) -> float:

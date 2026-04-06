@@ -41,15 +41,20 @@ from __future__ import annotations
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.ops.turboquant_kv_cache import TurboQuantLayout
+from vllm.v1.attention.ops.turboquant_kv_cache import (
+    TurboQuantLayout,
+    get_turboquant_kernel_meta,
+    get_turboquant_platform_requirement,
+    supports_turboquant_cuda,
+)
 
 
-def _require_gb10_cuda(device: torch.device) -> None:
+def _require_turboquant_cuda(device: torch.device) -> None:
     if device.type != "cuda":
         raise ValueError("TurboQuant Triton KV update requires CUDA tensors.")
     capability = torch.cuda.get_device_capability(device)
-    if capability != (12, 1):
-        raise ValueError("TurboQuant KV cache requires NVIDIA GB10 / SM121.")
+    if not supports_turboquant_cuda(capability):
+        raise ValueError(get_turboquant_platform_requirement())
 
 
 @triton.jit
@@ -581,7 +586,8 @@ def turboquant_write_packed_kv(
     if x.numel() == 0:
         return
 
-    _require_gb10_cuda(x.device)
+    _require_turboquant_cuda(x.device)
+    kernel_meta = get_turboquant_kernel_meta(x.device, x.shape[-1])
     if cache.dtype != torch.uint8:
         raise ValueError("TurboQuant KV cache update expects uint8 cache storage.")
     if x.ndim != 3:
@@ -604,7 +610,7 @@ def turboquant_write_packed_kv(
         raise ValueError("TurboQuant group metadata must match the KV head count.")
 
     group0, group1 = layout.groups
-    tile = 32
+    tile = kernel_meta.update_tile
     grid = (x.shape[0], x.shape[1])
     _turboquant_quantize_store_kernel[grid](
         x_ptr=x,
@@ -667,6 +673,6 @@ def turboquant_write_packed_kv(
         G1_VECTOR_NORM_OFFSET=group1.vector_norm_offset,
         G1_RESIDUAL_NORM_OFFSET=group1.residual_norm_offset,
         G1_LEVELS=1 << group1.mse_bits,
-        num_warps=4,
+        num_warps=kernel_meta.update_num_warps,
         num_stages=2,
     )

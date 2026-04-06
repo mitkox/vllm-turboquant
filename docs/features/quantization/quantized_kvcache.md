@@ -4,6 +4,12 @@
 
 Efficient memory usage is crucial for working with large language models. Quantizing the KV (Key-Value) cache to FP8 format can significantly reduce its memory footprint. This optimization enables you to store more tokens in memory, leading to improved throughput and support for longer context windows.
 
+## TurboQuant KV Cache
+
+This fork also supports TurboQuant KV cache on `RTX A6000 / SM86` and
+`GB10 / SM121`. For the recommended source-build and serving workflow, see
+[TurboQuant on RTX A6000 and CUDA 12.8](turboquant_a6000.md).
+
 > **Note:** When using the Flash Attention 3 backend with FP8 KV cache, attention operations are also performed in the quantized (FP8) domain. In this configuration, queries are quantized to FP8 in addition to keys and values.
 
 ### Supported FP8 KV-Cache Quantization Schemes
@@ -48,10 +54,6 @@ You can configure how the quantization scales are computed in vLLM using three d
 - `kv_cache_dtype="auto"`: Use the model's default data type
 - `kv_cache_dtype="fp8_e4m3"`: Supported on CUDA 11.8+ and ROCm (AMD GPUs)
 - `kv_cache_dtype="fp8_e5m2"`: Supported on CUDA 11.8+
-- `kv_cache_dtype="turboquant25"`, `"turboquant35"`:
-  Experimental GB10-only TurboQuant KV cache for the Triton attention
-  backend. Uses mixed-bit quantization with a QJL residual stage.
-  Requires `--enable-turboquant` and an NVIDIA GB10 (SM121) GPU.
 
 ---
 
@@ -189,44 +191,3 @@ if __name__ == "__main__":
 ```
 
 For more detailed and up-to-date examples, see the [`llm-compressor` official examples](https://github.com/vllm-project/llm-compressor/tree/main/examples/quantization_kv_cache).
-
----
-
-## Experimental TurboQuant KV Cache
-
-vLLM includes an experimental TurboQuant KV-cache path targeting the NVIDIA GB10 (SM121) GPU:
-
-```python
-from vllm import LLM, SamplingParams
-
-sampling_params = SamplingParams(temperature=0.0, max_tokens=32)
-llm = LLM(
-    model="meta-llama/Llama-3.1-8B-Instruct",
-    kv_cache_dtype="turboquant25",
-    enable_turboquant=True,
-    turboquant_metadata_path="/path/to/turboquant_kv.json",
-)
-print(llm.generate("Write a haiku about SRAM.", sampling_params)[0].outputs[0].text)
-```
-
-Notes:
-
-- TurboQuant uses a two-stage codec (MSE codebook + QJL residual) implemented
-  with dimension-aware Lloyd-Max codebooks, structured Hadamard-style
-  transforms, and GB10-only Triton fast paths.
-- `turboquant25` targets ~2.5 bits/element: `32x3-bit + 96x2-bit` for `head_size=128`.
-- `turboquant35` targets ~3.5 bits/element: `64x4-bit + 64x3-bit` for `head_size=128`.
-- Mixed-bit TurboQuant requires a per-layer metadata artifact. vLLM will use
-  `turboquant_metadata_path` when provided, otherwise it looks for
-  `turboquant_kv.json` under the local model directory.
-- A calibration metadata artifact can be generated with
-  `python benchmarks/generate_turboquant_metadata.py --model ... --kv-cache-dtype turboquant35 --prompts-file prompts.txt --output /path/to/turboquant_kv.json`.
-  The generator runs activation-based calibration over local prompts and stores
-  the selected per-head high-precision indices plus calibration provenance in
-  the sidecar JSON.
-- Unsupported cached attention variants are rejected instead of silently
-  falling back to a dense reference path.
-- Encoder-only layers in mixed models pass through the standard Triton encoder path.
-- CUDA-graph capture is disabled for TurboQuant because the KV write path is
-  not graph-safe.
-- Requires NVIDIA GB10 / SM121.

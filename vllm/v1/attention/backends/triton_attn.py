@@ -10,6 +10,10 @@ import torch
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.distributed.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -52,17 +56,20 @@ from vllm.v1.attention.ops.turboquant_kv_cache import (
     get_turboquant_mse_to_qjl_matrix,
     get_turboquant_mse_transform_matrix,
     get_turboquant_packed_dim,
+    get_turboquant_platform_requirement,
     get_turboquant_qjl_inverse_transform_matrix,
     get_turboquant_qjl_matrix,
     get_turboquant_qjl_transform_matrix,
     get_turboquant_rotation,
     is_turboquant_kv_cache,
+    supports_turboquant_cuda,
 )
 from vllm.v1.attention.ops.turboquant_metadata import (
     TurboQuantLayerMetadata,
     TurboQuantMetadata,
     discover_turboquant_metadata_path,
     load_turboquant_metadata,
+    slice_turboquant_layer_metadata_for_tp,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -72,11 +79,20 @@ logger = init_logger(__name__)
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
-GB10_CAPABILITY = DeviceCapability(12, 1)
 # The Triton prefill kernel already handles power-of-two head sizes up to 256.
 # Keep TurboQuant prefill on that kernel for common Qwen 27B/35B-class models
 # instead of dropping to the slow Python fallback on the first prompt.
 TURBOQUANT_TRITON_PREFILL_MAX_HEAD_SIZE = 256
+
+
+def _get_turboquant_tp_context() -> tuple[int, int]:
+    try:
+        return (
+            get_tensor_model_parallel_rank(),
+            get_tensor_model_parallel_world_size(),
+        )
+    except AssertionError:
+        return (0, 1)
 
 
 @dataclass
@@ -452,8 +468,8 @@ class TritonAttentionBackend(AttentionBackend):
             return None
         if not current_platform.is_cuda():
             return "TurboQuant KV cache requires CUDA"
-        if device_capability != GB10_CAPABILITY:
-            return "TurboQuant KV cache requires NVIDIA GB10 / SM121"
+        if not supports_turboquant_cuda(device_capability):
+            return get_turboquant_platform_requirement()
         return None
 
 
@@ -562,11 +578,12 @@ class TritonAttentionImpl(AttentionImpl):
             )
         self.use_alibi_sqrt = use_alibi_sqrt
         self.supports_quant_query_input = current_platform.is_cuda()
-
         if self.turboquant_bits is not None:
             capability = current_platform.get_device_capability()
-            if not current_platform.is_cuda() or capability != GB10_CAPABILITY:
-                raise RuntimeError("TurboQuant KV cache requires NVIDIA GB10 / SM121.")
+            if not current_platform.is_cuda() or not supports_turboquant_cuda(
+                capability
+            ):
+                raise RuntimeError(get_turboquant_platform_requirement())
             if turboquant_layer_name is None:
                 raise ValueError(
                     "TurboQuant KV cache requires the attention layer name for "
@@ -602,6 +619,18 @@ class TritonAttentionImpl(AttentionImpl):
                     f"{self._turboquant_metadata.head_size} vs {self.head_size}."
                 )
             layer_metadata = self._turboquant_metadata.get_layer(turboquant_layer_name)
+            if (
+                len(layer_metadata.key.high_precision_indices) != self.num_kv_heads
+                or len(layer_metadata.value.high_precision_indices) != self.num_kv_heads
+            ):
+                tp_rank, tp_size = _get_turboquant_tp_context()
+                if tp_size > 1:
+                    layer_metadata = slice_turboquant_layer_metadata_for_tp(
+                        layer_metadata,
+                        num_kv_heads=self.num_kv_heads,
+                        tp_rank=tp_rank,
+                        tp_size=tp_size,
+                    )
             self._turboquant_layer_metadata = layer_metadata
             if len(layer_metadata.key.high_precision_indices) != self.num_kv_heads:
                 raise ValueError(
@@ -616,7 +645,7 @@ class TritonAttentionImpl(AttentionImpl):
                     f"{self.num_kv_heads}."
                 )
             logger.info_once(
-                "TurboQuant enabled for layer %s with %s on Triton/GB10.",
+                "TurboQuant enabled for layer %s with %s on Triton/CUDA.",
                 turboquant_layer_name,
                 self.kv_cache_dtype,
                 scope="local",
@@ -670,8 +699,8 @@ class TritonAttentionImpl(AttentionImpl):
     def _validate_turboquant_device(self, device: torch.device) -> None:
         if device.type != "cuda":
             raise RuntimeError("TurboQuant KV cache requires CUDA.")
-        if torch.cuda.get_device_capability(device) != (12, 1):
-            raise RuntimeError("TurboQuant KV cache requires NVIDIA GB10 / SM121.")
+        if not supports_turboquant_cuda(torch.cuda.get_device_capability(device)):
+            raise RuntimeError(get_turboquant_platform_requirement())
 
     def _get_turboquant_update_tables(
         self,
@@ -1265,8 +1294,8 @@ class TritonAttentionImpl(AttentionImpl):
                 )
 
             if self.sinks is not None:
-                sink_logits = self.sinks[:, None, None].to(torch.float32).expand(
-                    -1, q_len, 1
+                sink_logits = (
+                    self.sinks[:, None, None].to(torch.float32).expand(-1, q_len, 1)
                 )
                 zero_value = torch.zeros(
                     (self.num_heads, 1, self.head_size),
@@ -1301,7 +1330,8 @@ class TritonAttentionImpl(AttentionImpl):
             return False
 
         query_lens_cpu = (
-            attn_metadata.query_start_loc_cpu[1:] - attn_metadata.query_start_loc_cpu[:-1]
+            attn_metadata.query_start_loc_cpu[1:]
+            - attn_metadata.query_start_loc_cpu[:-1]
         )
         return torch.equal(query_lens_cpu, attn_metadata.seq_lens_cpu)
 

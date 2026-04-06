@@ -83,8 +83,7 @@ def _cached_group_indices(
         high = torch.tensor(high_indices, dtype=torch.int64)
         if torch.any(high[:-1] >= high[1:]):
             raise ValueError(
-                "TurboQuant metadata high-precision indices must be strictly "
-                "sorted."
+                "TurboQuant metadata high-precision indices must be strictly sorted."
             )
         if high.min().item() < 0 or high.max().item() >= head_size:
             raise ValueError(
@@ -117,6 +116,72 @@ class TurboQuantLayerMetadata:
             "key_high_precision_indices": self.key.to_json(),
             "value_high_precision_indices": self.value.to_json(),
         }
+
+
+def slice_turboquant_layer_metadata_for_tp(
+    layer_metadata: TurboQuantLayerMetadata,
+    *,
+    num_kv_heads: int,
+    tp_rank: int,
+    tp_size: int,
+) -> TurboQuantLayerMetadata:
+    key_head_count = len(layer_metadata.key.high_precision_indices)
+    value_head_count = len(layer_metadata.value.high_precision_indices)
+    if key_head_count != value_head_count:
+        raise ValueError(
+            "TurboQuant metadata key/value KV head counts disagree: "
+            f"{key_head_count} vs {value_head_count}."
+        )
+    if key_head_count == num_kv_heads:
+        return layer_metadata
+    if tp_size <= 0:
+        raise ValueError(f"Invalid tensor parallel size for TurboQuant: {tp_size}.")
+    if tp_rank < 0 or tp_rank >= tp_size:
+        raise ValueError(
+            "Invalid tensor parallel rank for TurboQuant metadata slicing: "
+            f"{tp_rank} of {tp_size}."
+        )
+
+    total_num_kv_heads = key_head_count
+    if total_num_kv_heads >= tp_size:
+        if total_num_kv_heads % tp_size != 0:
+            raise ValueError(
+                "TurboQuant metadata KV head count is incompatible with tensor "
+                f"parallel size: {total_num_kv_heads} vs {tp_size}."
+            )
+        expected_num_kv_heads = total_num_kv_heads // tp_size
+        if expected_num_kv_heads != num_kv_heads:
+            raise ValueError(
+                "TurboQuant metadata KV head count does not match the per-rank "
+                "layer shape after tensor-parallel sharding: "
+                f"{expected_num_kv_heads} vs {num_kv_heads}."
+            )
+        start = tp_rank * num_kv_heads
+        end = start + num_kv_heads
+    else:
+        if tp_size % total_num_kv_heads != 0:
+            raise ValueError(
+                "TurboQuant metadata KV head count is incompatible with tensor "
+                f"parallel replication: {total_num_kv_heads} vs {tp_size}."
+            )
+        if num_kv_heads != 1:
+            raise ValueError(
+                "TurboQuant metadata KV head count does not match the replicated "
+                f"per-rank layer shape: expected 1, got {num_kv_heads}."
+            )
+        replicas = tp_size // total_num_kv_heads
+        shard_rank = tp_rank // replicas
+        start = shard_rank
+        end = shard_rank + 1
+
+    return TurboQuantLayerMetadata(
+        key=TurboQuantTensorMetadata(
+            layer_metadata.key.high_precision_indices[start:end]
+        ),
+        value=TurboQuantTensorMetadata(
+            layer_metadata.value.high_precision_indices[start:end]
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -165,7 +230,8 @@ class TurboQuantMetadata:
 
         raise KeyError(
             "TurboQuant metadata does not contain layer "
-            f"{layer_name!r}. Tried aliases: {', '.join(repr(name) for name in candidate_names)}."
+            f"{layer_name!r}. Tried aliases: "
+            f"{', '.join(repr(name) for name in candidate_names)}."
         )
 
     def to_json(self) -> dict[str, object]:
@@ -300,11 +366,11 @@ def discover_turboquant_metadata_path(
     explicit_path: str | None,
 ) -> str | None:
     if explicit_path is not None:
-        return explicit_path
+        return str(Path(explicit_path).expanduser().resolve())
     if model_name_or_path is None:
         return None
 
-    model_path = Path(model_name_or_path)
+    model_path = Path(model_name_or_path).expanduser().resolve()
     if model_path.is_file():
         model_path = model_path.parent
     elif not model_path.is_dir():
@@ -312,7 +378,7 @@ def discover_turboquant_metadata_path(
 
     metadata_path = model_path / "turboquant_kv.json"
     if metadata_path.is_file():
-        return str(metadata_path)
+        return str(metadata_path.resolve())
     return None
 
 

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Compare GB10 TurboQuant against the existing FP8 KV-cache path on the same
-# long-context workload.
+# Compare TurboQuant against the existing FP8 KV-cache path on the same
+# long-context workload on a supported CUDA system (RTX A6000 / SM86 or
+# GB10 / SM121).
 
 VENV_BIN="${VENV_BIN:-.venv/bin}"
 MODEL="${MODEL:-cyankiwi/Qwen3.5-27B-AWQ-4bit}"

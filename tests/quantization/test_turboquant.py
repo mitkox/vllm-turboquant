@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import vllm.v1.attention.backends.triton_attn as triton_attn_module
 from vllm.config.cache import CacheConfig
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.platforms import current_platform
@@ -37,23 +38,37 @@ from vllm.v1.attention.ops.turboquant_kv_cache import (
     get_turboquant_layout,
     get_turboquant_mse_inverse_transform_matrix,
     get_turboquant_packed_dim,
+    get_turboquant_platform_requirement,
     get_turboquant_qjl_inverse_transform_matrix,
     get_turboquant_qjl_matrix,
     get_turboquant_rotation,
     is_turboquant_kv_cache,
     pack_turboquant_indices,
     quantize_turboquant_vectors,
+    supports_turboquant_cuda,
     unpack_turboquant_indices,
 )
 from vllm.v1.attention.ops.turboquant_metadata import (
     TurboQuantCalibrationMetadata,
+    TurboQuantLayerMetadata,
+    TurboQuantTensorMetadata,
     build_default_turboquant_metadata,
     discover_turboquant_metadata_path,
     load_turboquant_metadata,
     save_turboquant_metadata,
+    slice_turboquant_layer_metadata_for_tp,
 )
 
 TEST_TURBOQUANT_LAYER = "model.layers.0.self_attn"
+TURBOQUANT_SUPPORTED_CAPABILITY = DeviceCapability(8, 6)
+TURBOQUANT_ALT_SUPPORTED_CAPABILITY = DeviceCapability(12, 1)
+TURBOQUANT_TEST_SKIP_REASON = get_turboquant_platform_requirement()
+
+
+def _has_supported_turboquant_cuda() -> bool:
+    return torch.cuda.is_available() and supports_turboquant_cuda(
+        torch.cuda.get_device_capability()
+    )
 
 
 def _get_turboquant_tables(
@@ -472,6 +487,50 @@ def test_turboquant_metadata_auto_discovery(tmp_path):
     assert discover_turboquant_metadata_path(str(model_dir), None) == str(metadata_path)
 
 
+def test_turboquant_metadata_tp_slice_for_partitioned_heads():
+    layer_metadata = TurboQuantLayerMetadata(
+        key=TurboQuantTensorMetadata(
+            tuple(tuple(range(i, i + 32)) for i in (0, 32, 64, 96))
+        ),
+        value=TurboQuantTensorMetadata(
+            tuple(tuple(range(i, i + 32)) for i in (100, 132, 164, 196))
+        ),
+    )
+
+    sliced = slice_turboquant_layer_metadata_for_tp(
+        layer_metadata,
+        num_kv_heads=2,
+        tp_rank=1,
+        tp_size=2,
+    )
+
+    assert sliced.key.high_precision_indices == (
+        tuple(range(64, 96)),
+        tuple(range(96, 128)),
+    )
+    assert sliced.value.high_precision_indices == (
+        tuple(range(164, 196)),
+        tuple(range(196, 228)),
+    )
+
+
+def test_turboquant_metadata_tp_slice_for_replicated_heads():
+    layer_metadata = TurboQuantLayerMetadata(
+        key=TurboQuantTensorMetadata((tuple(range(32)), tuple(range(32, 64)))),
+        value=TurboQuantTensorMetadata((tuple(range(64, 96)), tuple(range(96, 128)))),
+    )
+
+    sliced = slice_turboquant_layer_metadata_for_tp(
+        layer_metadata,
+        num_kv_heads=1,
+        tp_rank=2,
+        tp_size=4,
+    )
+
+    assert sliced.key.high_precision_indices == (tuple(range(32, 64)),)
+    assert sliced.value.high_precision_indices == (tuple(range(96, 128)),)
+
+
 @torch.inference_mode()
 def test_turboquant_pack_unpack_roundtrip():
     head_size = 128
@@ -657,10 +716,7 @@ def test_turboquant_calibration_metadata_builder_skips_non_attention_layers():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] != 12
-    or torch.cuda.get_device_capability()[1] != 1,
-    reason="GB10 / SM121 CUDA device required",
+    not _has_supported_turboquant_cuda(), reason=TURBOQUANT_TEST_SKIP_REASON
 )
 @pytest.mark.parametrize("cache_dtype", ["turboquant25", "turboquant35"])
 @torch.inference_mode()
@@ -884,7 +940,7 @@ def test_turboquant_disables_cudagraph_support_for_triton_builder():
     assert support == AttentionCGSupport.NEVER
 
 
-def test_turboquant_validate_configuration_rejects_non_gb10():
+def test_turboquant_validate_configuration_rejects_unsupported_cuda_device():
     reasons = TritonAttentionBackend.validate_configuration(
         head_size=128,
         dtype=torch.float16,
@@ -899,10 +955,14 @@ def test_turboquant_validate_configuration_rejects_non_gb10():
         attn_type=AttentionType.DECODER,
     )
 
-    assert "TurboQuant KV cache requires NVIDIA GB10 / SM121" in reasons
+    assert get_turboquant_platform_requirement() in reasons
 
 
-def test_turboquant_validate_configuration_allows_sinks():
+@pytest.mark.parametrize(
+    "device_capability",
+    [TURBOQUANT_SUPPORTED_CAPABILITY, TURBOQUANT_ALT_SUPPORTED_CAPABILITY],
+)
+def test_turboquant_validate_configuration_allows_sinks(device_capability):
     reasons = TritonAttentionBackend.validate_configuration(
         head_size=128,
         dtype=torch.float16,
@@ -913,14 +973,18 @@ def test_turboquant_validate_configuration_allows_sinks():
         use_sparse=False,
         use_mm_prefix=False,
         use_per_head_quant_scales=False,
-        device_capability=DeviceCapability(12, 1),
+        device_capability=device_capability,
         attn_type=AttentionType.DECODER,
     )
 
     assert "TurboQuant KV cache does not support attention sinks" not in reasons
 
 
-def test_turboquant_validate_configuration_allows_mm_prefix():
+@pytest.mark.parametrize(
+    "device_capability",
+    [TURBOQUANT_SUPPORTED_CAPABILITY, TURBOQUANT_ALT_SUPPORTED_CAPABILITY],
+)
+def test_turboquant_validate_configuration_allows_mm_prefix(device_capability):
     reasons = TritonAttentionBackend.validate_configuration(
         head_size=128,
         dtype=torch.float16,
@@ -931,7 +995,7 @@ def test_turboquant_validate_configuration_allows_mm_prefix():
         use_sparse=False,
         use_mm_prefix=True,
         use_per_head_quant_scales=False,
-        device_capability=DeviceCapability(12, 1),
+        device_capability=device_capability,
         attn_type=AttentionType.DECODER,
     )
 
@@ -943,7 +1007,7 @@ def test_cache_config_requires_feature_gate(monkeypatch):
     monkeypatch.setattr(
         current_platform,
         "get_device_capability",
-        lambda device_id=0: DeviceCapability(12, 1),
+        lambda device_id=0: TURBOQUANT_SUPPORTED_CAPABILITY,
     )
 
     with pytest.raises(ValueError, match="enable_turboquant=True"):
@@ -966,7 +1030,7 @@ def test_turboquant_impl_allows_extended_modes_at_init(monkeypatch, kwargs):
     monkeypatch.setattr(
         current_platform,
         "get_device_capability",
-        lambda device_id=0: DeviceCapability(12, 1),
+        lambda device_id=0: TURBOQUANT_SUPPORTED_CAPABILITY,
     )
 
     impl = TritonAttentionImpl(
@@ -992,7 +1056,7 @@ def test_turboquant_impl_rejects_metadata_kv_head_count_mismatch(monkeypatch):
     monkeypatch.setattr(
         current_platform,
         "get_device_capability",
-        lambda device_id=0: DeviceCapability(12, 1),
+        lambda device_id=0: TURBOQUANT_SUPPORTED_CAPABILITY,
     )
 
     with pytest.raises(ValueError, match="KV head count does not match layer"):
@@ -1010,12 +1074,47 @@ def test_turboquant_impl_rejects_metadata_kv_head_count_mismatch(monkeypatch):
         )
 
 
+def test_turboquant_impl_accepts_global_metadata_for_replicated_kv_heads(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform,
+        "get_device_capability",
+        lambda device_id=0: TURBOQUANT_SUPPORTED_CAPABILITY,
+    )
+    monkeypatch.setattr(
+        triton_attn_module,
+        "get_tensor_model_parallel_rank",
+        lambda: 2,
+    )
+    monkeypatch.setattr(
+        triton_attn_module,
+        "get_tensor_model_parallel_world_size",
+        lambda: 4,
+    )
+
+    impl = TritonAttentionImpl(
+        num_heads=8,
+        head_size=128,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="turboquant25",
+        attn_type=AttentionType.DECODER,
+        turboquant_layer_name=TEST_TURBOQUANT_LAYER,
+        turboquant_metadata=_get_test_turboquant_metadata("turboquant25", 128, 2),
+    )
+
+    assert impl._turboquant_layer_metadata is not None
+    assert len(impl._turboquant_layer_metadata.key.high_precision_indices) == 1
+
+
 def test_turboquant_impl_allows_encoder_only_layers(monkeypatch):
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(
         current_platform,
         "get_device_capability",
-        lambda device_id=0: DeviceCapability(12, 1),
+        lambda device_id=0: TURBOQUANT_SUPPORTED_CAPABILITY,
     )
 
     impl = TritonAttentionImpl(
@@ -1039,7 +1138,7 @@ def test_turboquant_impl_disables_rope_kvcache_fusion(monkeypatch):
     monkeypatch.setattr(
         current_platform,
         "get_device_capability",
-        lambda device_id=0: DeviceCapability(12, 1),
+        lambda device_id=0: TURBOQUANT_SUPPORTED_CAPABILITY,
     )
 
     impl = TritonAttentionImpl(
@@ -1076,7 +1175,7 @@ def test_turboquant_cascade_rejects_unsupported_feature_combinations(
     monkeypatch.setattr(
         current_platform,
         "get_device_capability",
-        lambda device_id=0: DeviceCapability(12, 1),
+        lambda device_id=0: TURBOQUANT_SUPPORTED_CAPABILITY,
     )
 
     impl = TritonAttentionImpl(
@@ -1144,7 +1243,7 @@ def test_turboquant_prefill_with_allocated_cache_uses_triton_prefill(monkeypatch
     monkeypatch.setattr(
         current_platform,
         "get_device_capability",
-        lambda device_id=0: DeviceCapability(12, 1),
+        lambda device_id=0: TURBOQUANT_SUPPORTED_CAPABILITY,
     )
 
     impl = TritonAttentionImpl(
@@ -1263,7 +1362,7 @@ def test_turboquant_prefill_large_head_uses_triton_prefill(monkeypatch):
     monkeypatch.setattr(
         current_platform,
         "get_device_capability",
-        lambda device_id=0: DeviceCapability(12, 1),
+        lambda device_id=0: TURBOQUANT_SUPPORTED_CAPABILITY,
     )
 
     impl = TritonAttentionImpl(
@@ -1370,10 +1469,7 @@ def test_turboquant_prefill_large_head_uses_triton_prefill(monkeypatch):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] != 12
-    or torch.cuda.get_device_capability()[1] != 1,
-    reason="GB10 / SM121 CUDA device required",
+    not _has_supported_turboquant_cuda(), reason=TURBOQUANT_TEST_SKIP_REASON
 )
 @pytest.mark.parametrize("cache_dtype", ["turboquant25", "turboquant35"])
 @torch.inference_mode()
@@ -1443,10 +1539,7 @@ def test_turboquant_fused_cache_update_matches_reference(cache_dtype: str):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] != 12
-    or torch.cuda.get_device_capability()[1] != 1,
-    reason="GB10 / SM121 CUDA device required",
+    not _has_supported_turboquant_cuda(), reason=TURBOQUANT_TEST_SKIP_REASON
 )
 @pytest.mark.parametrize("cache_dtype", ["turboquant25", "turboquant35"])
 @torch.inference_mode()
@@ -1556,10 +1649,7 @@ def test_turboquant_prefill_reads_quantized_cache(cache_dtype: str):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] != 12
-    or torch.cuda.get_device_capability()[1] != 1,
-    reason="GB10 / SM121 CUDA device required",
+    not _has_supported_turboquant_cuda(), reason=TURBOQUANT_TEST_SKIP_REASON
 )
 @pytest.mark.parametrize(
     ("feature", "sliding_window", "logits_soft_cap"),
@@ -1683,15 +1773,12 @@ def test_turboquant_extended_cached_attention_matches_reference(
         logits_soft_cap=impl.logits_soft_cap,
     )
 
-    atol, rtol = ((7e-1, 7e-1) if feature == "softcap" else (8e-2, 8e-2))
+    atol, rtol = (7e-1, 7e-1) if feature == "softcap" else (8e-2, 8e-2)
     torch.testing.assert_close(result, expected, atol=atol, rtol=rtol)
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] != 12
-    or torch.cuda.get_device_capability()[1] != 1,
-    reason="GB10 / SM121 CUDA device required",
+    not _has_supported_turboquant_cuda(), reason=TURBOQUANT_TEST_SKIP_REASON
 )
 @pytest.mark.parametrize("cache_dtype", ["turboquant25", "turboquant35"])
 @torch.inference_mode()
@@ -1720,7 +1807,9 @@ def test_turboquant_cross_attention_matches_reference(cache_dtype: str):
         ),
     )
 
-    query = torch.randn(query_len, num_heads, head_size, dtype=torch.float16, device=device)
+    query = torch.randn(
+        query_len, num_heads, head_size, dtype=torch.float16, device=device
+    )
     key = torch.randn(
         encoder_seq_len, num_kv_heads, head_size, dtype=torch.float16, device=device
     )
@@ -1800,10 +1889,7 @@ def test_turboquant_cross_attention_matches_reference(cache_dtype: str):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] != 12
-    or torch.cuda.get_device_capability()[1] != 1,
-    reason="GB10 / SM121 CUDA device required",
+    not _has_supported_turboquant_cuda(), reason=TURBOQUANT_TEST_SKIP_REASON
 )
 @pytest.mark.parametrize("cache_dtype", ["turboquant25", "turboquant35"])
 @torch.inference_mode()
@@ -1832,7 +1918,9 @@ def test_turboquant_rope_cache_update_matches_reference(
         ),
     )
 
-    query = torch.randn(seq_len, num_heads, head_size, dtype=torch.float16, device=device)
+    query = torch.randn(
+        seq_len, num_heads, head_size, dtype=torch.float16, device=device
+    )
     key = torch.randn_like(query)
     value = torch.randn_like(key)
     positions = torch.arange(seq_len, dtype=torch.int64, device=device)

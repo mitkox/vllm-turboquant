@@ -8,6 +8,10 @@ from pydantic import Field, SkipValidation, field_validator, model_validator
 
 from vllm.config.utils import config
 from vllm.logger import init_logger
+from vllm.v1.attention.ops.turboquant_kv_cache import (
+    get_turboquant_platform_requirement,
+    supports_turboquant_cuda,
+)
 
 logger = init_logger(__name__)
 
@@ -92,7 +96,7 @@ class CacheConfig:
     cpu_kvcache_space_bytes: int | None = None
     """(CPU backend only) CPU key-value cache space."""
     enable_turboquant: bool = False
-    """Enable the GB10-only TurboQuant KV cache (requires NVIDIA GB10 / SM121)."""
+    """Enable the TurboQuant KV cache on supported CUDA GPUs."""
     turboquant_metadata_path: str | None = None
     """Optional path to the TurboQuant per-layer metadata JSON artifact.
     If unset, vLLM looks for `turboquant_kv.json` under the local model path."""
@@ -238,7 +242,7 @@ class CacheConfig:
         elif cache_dtype.startswith("turboquant"):
             logger.warning(
                 "Using TurboQuant KV cache with the Triton attention backend "
-                "(requires NVIDIA GB10 / SM121)."
+                "(supports RTX A6000 / SM86 and GB10 / SM121)."
             )
         return cache_dtype
 
@@ -258,6 +262,6 @@ class CacheConfig:
             raise ValueError("TurboQuant KV cache requires CUDA.")
 
         capability = current_platform.get_device_capability()
-        if capability is None or (capability.major, capability.minor) != (12, 1):
-            raise ValueError("TurboQuant KV cache requires NVIDIA GB10 / SM121.")
+        if not supports_turboquant_cuda(capability):
+            raise ValueError(get_turboquant_platform_requirement())
         return self
